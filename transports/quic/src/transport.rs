@@ -23,7 +23,7 @@ use crate::hole_punching::hole_puncher;
 use crate::provider::Provider;
 use crate::{ConnectError, Connecting, Connection, Error};
 
-use futures::channel::oneshot;
+use futures::channel::{mpsc, oneshot};
 use futures::future::{BoxFuture, Either};
 use futures::ready;
 use futures::stream::StreamExt;
@@ -232,12 +232,17 @@ impl<P: Provider> Transport for GenTransport<P> {
 
         let socket_c = socket.try_clone().map_err(Self::Error::from)?;
         let endpoint = Self::new_endpoint(endpoint_config, Some(server_config), socket)?;
+        let post_handshake_sender = self
+            .quinn_config
+            .post_handshake_connection_sender
+            .clone();
         let listener = Listener::new(
             listener_id,
             socket_c,
             endpoint,
             self.handshake_timeout,
             version,
+            post_handshake_sender,
         )?;
         self.listeners.push(listener);
 
@@ -301,6 +306,10 @@ impl<P: Provider> Transport for GenTransport<P> {
                 if version == ProtocolVersion::Draft29 {
                     client_config.version(0xff00_001d);
                 }
+                let post_handshake_sender = self
+                    .quinn_config
+                    .post_handshake_connection_sender
+                    .clone();
                 Ok(Box::pin(async move {
                     // This `"l"` seems necessary because an empty string is an invalid domain
                     // name. While we don't use domain names, the underlying rustls library
@@ -308,7 +317,9 @@ impl<P: Provider> Transport for GenTransport<P> {
                     let connecting = endpoint
                         .connect_with(client_config, socket_addr, "l")
                         .map_err(ConnectError)?;
-                    Connecting::new(connecting, handshake_timeout).await
+                    Connecting::new(connecting, handshake_timeout)
+                        .with_post_handshake_connection_sender(post_handshake_sender)
+                        .await
                 }))
             }
             (Endpoint::Listener, _) => {
@@ -452,6 +463,11 @@ struct Listener<P: Provider> {
     close_listener_waker: Option<Waker>,
 
     listening_addresses: HashSet<IpAddr>,
+
+    /// Optional side-channel sender forwarded into [`Connecting`] for each
+    /// inbound connection. See [`crate::Config::post_handshake_connection_sender`].
+    post_handshake_connection_sender:
+        Option<mpsc::Sender<(libp2p_identity::PeerId, quinn::Connection)>>,
 }
 
 impl<P: Provider> Listener<P> {
@@ -461,6 +477,9 @@ impl<P: Provider> Listener<P> {
         endpoint: quinn::Endpoint,
         handshake_timeout: Duration,
         version: ProtocolVersion,
+        post_handshake_connection_sender: Option<
+            mpsc::Sender<(libp2p_identity::PeerId, quinn::Connection)>,
+        >,
     ) -> Result<Self, Error> {
         let if_watcher;
         let pending_event;
@@ -494,6 +513,7 @@ impl<P: Provider> Listener<P> {
             pending_event,
             close_listener_waker: None,
             listening_addresses,
+            post_handshake_connection_sender,
         })
     }
 
@@ -610,7 +630,10 @@ impl<P: Provider> Stream for Listener<P> {
                     let send_back_addr = socketaddr_to_multiaddr(&remote_addr, self.version);
 
                     let event = TransportEvent::Incoming {
-                        upgrade: Connecting::new(connecting, self.handshake_timeout),
+                        upgrade: Connecting::new(connecting, self.handshake_timeout)
+                            .with_post_handshake_connection_sender(
+                                self.post_handshake_connection_sender.clone(),
+                            ),
                         local_addr,
                         send_back_addr,
                         listener_id: self.listener_id,

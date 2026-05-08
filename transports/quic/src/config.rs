@@ -18,11 +18,18 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
+use futures::channel::mpsc;
+use libp2p_identity::PeerId;
 use quinn::{
     crypto::rustls::{QuicClientConfig, QuicServerConfig},
     MtuDiscoveryConfig, VarInt,
 };
 use std::{sync::Arc, time::Duration};
+
+/// Default datagram send buffer size (1 MiB) when datagrams are enabled.
+const DEFAULT_DATAGRAM_SEND_BUFFER_SIZE: usize = 1024 * 1024;
+/// Default datagram receive buffer size (1 MiB) when datagrams are enabled.
+const DEFAULT_DATAGRAM_RECEIVE_BUFFER_SIZE: usize = 1024 * 1024;
 
 /// Config for the transport.
 #[derive(Clone)]
@@ -60,6 +67,50 @@ pub struct Config {
     /// As client the version is chosen based on the remote's address.
     pub support_draft_29: bool,
 
+    /// Whether to advertise QUIC unreliable datagram support (RFC 9221) to peers.
+    ///
+    /// When `true`, the underlying [`quinn::TransportConfig`] sets non-zero
+    /// send/receive datagram buffer sizes (see [`Config::datagram_send_buffer_size`] and
+    /// [`Config::datagram_receive_buffer_size`]) so that datagrams are negotiated during
+    /// the QUIC handshake. Applications obtain post-handshake [`quinn::Connection`]
+    /// handles via [`Config::post_handshake_connection_sender`] and call
+    /// `connection.send_datagram(...)` / `connection.read_datagram().await` directly.
+    ///
+    /// Default: `false` — bit-identical to upstream libp2p-quic behaviour. Enable only
+    /// when downstream code (e.g. nerw-core's audio transport, NRW-000040 Phase B-1b)
+    /// needs unreliable datagrams.
+    pub enable_datagrams: bool,
+
+    /// Per-connection send buffer size for QUIC unreliable datagrams (in bytes).
+    ///
+    /// Applied only when [`Config::enable_datagrams`] is `true`. Quinn implements
+    /// drop-old policy natively: when the buffer is full, the oldest queued datagram is
+    /// discarded to make room for the newest one. Default: 1 MiB.
+    pub datagram_send_buffer_size: usize,
+
+    /// Per-connection receive buffer size for QUIC unreliable datagrams (in bytes).
+    ///
+    /// Applied only when [`Config::enable_datagrams`] is `true`. Default: 1 MiB.
+    pub datagram_receive_buffer_size: usize,
+
+    /// Optional channel that delivers each post-handshake [`quinn::Connection`] together
+    /// with the remote [`PeerId`] to application code, so the application can call
+    /// `Connection::send_datagram` / `Connection::read_datagram` outside the
+    /// libp2p Swarm.
+    ///
+    /// `quinn::Connection` is `Clone` (internally `Arc<ConnectionRef>`), so cloning the
+    /// handle into the channel is cheap and does not affect the libp2p stream-multiplexer
+    /// path. The fork populates this sender from
+    /// [`crate::connection::Connecting`] after the TLS handshake completes (see
+    /// `connecting.rs`). On `try_send` failure (channel full or closed) the side-channel
+    /// silently drops the handle — application code that has not subscribed yet, or that
+    /// has not drained, simply does not learn about that particular connection.
+    ///
+    /// Default: `None`. Set to `Some(sender)` from a paired
+    /// `mpsc::channel::<(PeerId, quinn::Connection)>(...)`. The receiver should be
+    /// drained promptly by the application's event loop.
+    pub post_handshake_connection_sender: Option<mpsc::Sender<(PeerId, quinn::Connection)>>,
+
     /// TLS client config for the inner [`quinn::ClientConfig`].
     client_tls_config: Arc<QuicClientConfig>,
     /// TLS server config for the inner [`quinn::ServerConfig`].
@@ -95,6 +146,12 @@ impl Config {
             max_stream_data: 10_000_000,
             keypair: keypair.clone(),
             mtu_discovery_config: Some(Default::default()),
+            // Datagram surface defaults are off — bit-identical to upstream
+            // until the application opts in.
+            enable_datagrams: false,
+            datagram_send_buffer_size: DEFAULT_DATAGRAM_SEND_BUFFER_SIZE,
+            datagram_receive_buffer_size: DEFAULT_DATAGRAM_RECEIVE_BUFFER_SIZE,
+            post_handshake_connection_sender: None,
         }
     }
 
@@ -114,11 +171,30 @@ impl Config {
 }
 
 /// Represents the inner configuration for [`quinn`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct QuinnConfig {
     pub(crate) client_config: quinn::ClientConfig,
     pub(crate) server_config: quinn::ServerConfig,
     pub(crate) endpoint_config: quinn::EndpointConfig,
+    /// Forwarded from [`Config::post_handshake_connection_sender`]. Threaded through
+    /// to [`crate::connection::Connecting`] so that newly-handshaked
+    /// `quinn::Connection` handles can be surfaced to application code.
+    pub(crate) post_handshake_connection_sender:
+        Option<mpsc::Sender<(PeerId, quinn::Connection)>>,
+}
+
+impl std::fmt::Debug for QuinnConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QuinnConfig")
+            .field("client_config", &"<quinn::ClientConfig>")
+            .field("server_config", &"<quinn::ServerConfig>")
+            .field("endpoint_config", &self.endpoint_config)
+            .field(
+                "post_handshake_connection_sender",
+                &self.post_handshake_connection_sender.is_some(),
+            )
+            .finish()
+    }
 }
 
 impl From<Config> for QuinnConfig {
@@ -135,13 +211,27 @@ impl From<Config> for QuinnConfig {
             handshake_timeout: _,
             keypair,
             mtu_discovery_config,
+            enable_datagrams,
+            datagram_send_buffer_size,
+            datagram_receive_buffer_size,
+            post_handshake_connection_sender,
         } = config;
         let mut transport = quinn::TransportConfig::default();
         // Disable uni-directional streams.
         transport.max_concurrent_uni_streams(0u32.into());
         transport.max_concurrent_bidi_streams(max_concurrent_stream_limit.into());
-        // Disable datagrams.
-        transport.datagram_receive_buffer_size(None);
+        // Datagram surface (RFC 9221). When disabled (default — upstream
+        // behaviour), `datagram_receive_buffer_size(None)` advertises 0 to
+        // the peer, which negotiates datagrams off entirely. When enabled,
+        // both buffers are sized so quinn's native drop-old policy has room
+        // to absorb burst traffic before evicting the oldest queued datagram.
+        if enable_datagrams {
+            transport.datagram_send_buffer_size(datagram_send_buffer_size);
+            transport.datagram_receive_buffer_size(Some(datagram_receive_buffer_size));
+        } else {
+            // Disable datagrams (upstream-bit-identical default).
+            transport.datagram_receive_buffer_size(None);
+        }
         transport.keep_alive_interval(Some(keep_alive_interval));
         transport.max_idle_timeout(Some(VarInt::from_u32(max_idle_timeout).into()));
         transport.allow_spin(false);
@@ -176,6 +266,7 @@ impl From<Config> for QuinnConfig {
             client_config,
             server_config,
             endpoint_config,
+            post_handshake_connection_sender,
         }
     }
 }

@@ -75,6 +75,13 @@ pub use provider::tokio;
 pub use provider::Provider;
 pub use transport::GenTransport;
 
+/// Re-export of [`quinn`] so consumers can hold typed `quinn::Connection`
+/// handles delivered through [`Config::post_handshake_connection_sender`]
+/// without depending on `quinn` directly. Application code uses
+/// [`quinn::Connection::send_datagram`] / [`quinn::Connection::read_datagram`]
+/// for the QUIC unreliable-datagram surface (RFC 9221).
+pub use quinn;
+
 /// Errors that may happen on the [`GenTransport`] or a single [`Connection`].
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

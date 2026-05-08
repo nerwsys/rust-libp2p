@@ -23,6 +23,7 @@
 use crate::{Connection, ConnectionError, Error};
 
 use futures::{
+    channel::mpsc,
     future::{select, Either, FutureExt, Select},
     prelude::*,
 };
@@ -39,13 +40,30 @@ use std::{
 #[derive(Debug)]
 pub struct Connecting {
     connecting: Select<quinn::Connecting, Delay>,
+    /// Optional side-channel that receives the post-handshake `quinn::Connection`
+    /// together with the remote peer id. See [`crate::Config::post_handshake_connection_sender`]
+    /// for the full rationale (datagram surface for application code).
+    post_handshake_connection_sender:
+        Option<mpsc::Sender<(PeerId, quinn::Connection)>>,
 }
 
 impl Connecting {
     pub(crate) fn new(connection: quinn::Connecting, timeout: Duration) -> Self {
         Connecting {
             connecting: select(connection, Delay::new(timeout)),
+            post_handshake_connection_sender: None,
         }
+    }
+
+    /// Configure the optional post-handshake side-channel. When set, the
+    /// `quinn::Connection` is cloned and pushed into the channel after the
+    /// handshake completes (see [`Future::poll`]).
+    pub(crate) fn with_post_handshake_connection_sender(
+        mut self,
+        sender: Option<mpsc::Sender<(PeerId, quinn::Connection)>>,
+    ) -> Self {
+        self.post_handshake_connection_sender = sender;
+        self
     }
 }
 
@@ -77,6 +95,19 @@ impl Future for Connecting {
         };
 
         let peer_id = Self::remote_peer_id(&connection);
+
+        // Side-channel delivery: if the application set
+        // `Config::post_handshake_connection_sender`, push a clone of the
+        // `quinn::Connection` plus the remote peer id. `quinn::Connection`
+        // is `Clone` (internally `Arc<ConnectionRef>`), so this is cheap and
+        // does not interfere with the libp2p stream-multiplexer view.
+        // Failures (channel full / closed) are deliberately silent — the
+        // application either has not subscribed yet or is not draining; in
+        // both cases the libp2p connection still proceeds normally.
+        if let Some(sender) = self.post_handshake_connection_sender.as_mut() {
+            let _ = sender.try_send((peer_id, connection.clone()));
+        }
+
         let muxer = Connection::new(connection);
         Poll::Ready(Ok((peer_id, muxer)))
     }
