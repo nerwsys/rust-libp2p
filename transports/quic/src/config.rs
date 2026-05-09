@@ -146,9 +146,13 @@ impl Config {
             max_stream_data: 10_000_000,
             keypair: keypair.clone(),
             mtu_discovery_config: Some(Default::default()),
-            // Datagram surface defaults are off — bit-identical to upstream
-            // until the application opts in.
-            enable_datagrams: false,
+            // Datagram surface ON by default in tolki-datagram fork (Pavel
+            // directive 2026-05-09 — wire-protocol-v2 нуждается в RFC 9221
+            // datagrams для voice path; обходить через прямой quinn::Connection
+            // доступ — anti-pattern). Upstream libp2p-quic ставит false; мы
+            // флипаем в форке. Application может opt-out явным
+            // .enable_datagrams(false) если нужно.
+            enable_datagrams: true,
             datagram_send_buffer_size: DEFAULT_DATAGRAM_SEND_BUFFER_SIZE,
             datagram_receive_buffer_size: DEFAULT_DATAGRAM_RECEIVE_BUFFER_SIZE,
             post_handshake_connection_sender: None,
